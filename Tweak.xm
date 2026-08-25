@@ -413,7 +413,8 @@ static void MJWaitForVisibleIncoming(id wrap, NSString *chat, NSUInteger attempt
         return;
     }
     if (attempt >= 8) {
-        MJQueueIncoming(chat, wrap);
+        if (MJIsChatPageVisible()) MJTriggerIncoming(wrap);
+        else MJQueueIncoming(chat, wrap);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
