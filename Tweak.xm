@@ -313,6 +313,59 @@ static BOOL MJIncomingMatchesVisibleChat(NSString *target, id wrap, NSString *vi
     return [candidates containsObject:visibleChat];
 }
 
+static BOOL MJVisibleCellContainsWrap(UIView *view, id wrap) {
+    if (!view || !wrap) return NO;
+    if ([view isKindOfClass:UITableViewCell.class] || [view isKindOfClass:UICollectionViewCell.class]) {
+        for (NSString *key in @[@"m_msgWrap", @"m_messageWrap", @"msgWrap", @"messageWrap", @"m_wrap", @"wrap"]) {
+            if (MJValue(view, key) == wrap) return YES;
+        }
+    }
+    for (UIView *subview in view.subviews) {
+        if (MJVisibleCellContainsWrap(subview, wrap)) return YES;
+    }
+    return NO;
+}
+
+static BOOL MJVisiblePageContainsWrap(id wrap) {
+    if (!MJIsChatPageVisible() || !wrap) return NO;
+    UIViewController *controller = MJTopViewController();
+    __block BOOL found = NO;
+    __block void (^visit)(UIView *);
+    visit = ^(UIView *view) {
+        if (!view || found) return;
+        if ([view isKindOfClass:UITableView.class]) {
+            for (UITableViewCell *cell in ((UITableView *)view).visibleCells) {
+                if (MJVisibleCellContainsWrap(cell, wrap)) { found = YES; return; }
+            }
+            return;
+        } else if ([view isKindOfClass:UICollectionView.class]) {
+            for (UICollectionViewCell *cell in ((UICollectionView *)view).visibleCells) {
+                if (MJVisibleCellContainsWrap(cell, wrap)) { found = YES; return; }
+            }
+            return;
+        }
+        for (UIView *subview in view.subviews) visit(subview);
+    };
+    visit(controller.view);
+    return found;
+}
+
+static void MJWaitForVisibleIncoming(id wrap, NSString *chat, NSUInteger attempt) {
+    if (!wrap || !MJIsChatPageVisible()) return;
+    if (MJVisiblePageContainsWrap(wrap)) {
+        MJTriggerIncoming(wrap);
+        return;
+    }
+    if (attempt >= 8) {
+        MJQueueIncoming(chat, wrap);
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        MJWaitForVisibleIncoming(wrap, chat, attempt + 1);
+    });
+}
+
 static void MJScheduleIncoming(NSString *target, id wrap) {
     if (!wrap || [MJValue(wrap, @"m_uiMessageType") integerValue] != 1 ||
         !MJIncomingWrap(wrap) || !MJMatches(wrap)) return;
@@ -320,7 +373,8 @@ static void MJScheduleIncoming(NSString *target, id wrap) {
         NSString *visibleChat = MJControllerChatUser(MJTopViewController());
         NSString *chat = MJIncomingChatCandidate(target, wrap, visibleChat);
         BOOL sameChat = MJIncomingMatchesVisibleChat(target, wrap, visibleChat);
-        if (sameChat || (visibleChat.length == 0 && MJIsChatPageVisible())) MJTriggerIncoming(wrap);
+        if (sameChat) MJTriggerIncoming(wrap);
+        else if (MJIsChatPageVisible()) MJWaitForVisibleIncoming(wrap, chat, 0);
         else MJQueueIncoming(chat, wrap);
     });
 }
