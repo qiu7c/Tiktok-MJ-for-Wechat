@@ -404,19 +404,20 @@ static void MJScheduleIncomingCellCheck(UIView *cell) {
 %hook CommonMessageCellView
 - (void)setViewModel:(id)viewModel {
     %orig(viewModel);
-    MJScheduleIncomingCellCheck(self);
+    MJScheduleIncomingCellCheck((UIView *)self);
 }
 - (void)updateStatus {
     %orig;
-    MJScheduleIncomingCellCheck(self);
+    MJScheduleIncomingCellCheck((UIView *)self);
 }
 - (void)updateNodeStatus {
     %orig;
-    MJScheduleIncomingCellCheck(self);
+    MJScheduleIncomingCellCheck((UIView *)self);
 }
 - (void)didMoveToWindow {
     %orig;
-    if (self.window) MJScheduleIncomingCellCheck(self);
+    UIView *cell = (UIView *)self;
+    if (cell.window) MJScheduleIncomingCellCheck(cell);
 }
 %end
 
