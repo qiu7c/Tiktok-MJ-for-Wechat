@@ -285,8 +285,15 @@ static BOOL MJIncomingWrap(id wrap) {
     NSString *current = MJCurrentUser();
     NSString *from = MJString(MJValue(wrap, @"m_nsFromUsr"));
     NSString *real = MJString(MJValue(wrap, @"m_nsRealChatUsr"));
-    if (current.length == 0 || (from.length == 0 && real.length == 0)) return NO;
-    return ![from isEqualToString:current] && ![real isEqualToString:current];
+    NSString *to = MJString(MJValue(wrap, @"m_nsToUsr"));
+    NSString *chatRoom = MJString(MJValue(wrap, @"m_nsChatRoomUsr"));
+    if (current.length == 0) return NO;
+    BOOL group = [from containsString:@"@chatroom"] ||
+                 [to containsString:@"@chatroom"] ||
+                 [chatRoom containsString:@"@chatroom"];
+    NSString *sender = group ? real : from;
+    if (sender.length == 0 && ![from containsString:@"@chatroom"]) sender = from;
+    return sender.length > 0 && ![sender isEqualToString:current];
 }
 
 static void MJQueueIncoming(NSString *target, id wrap) {
