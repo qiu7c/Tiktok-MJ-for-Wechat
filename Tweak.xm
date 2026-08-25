@@ -22,6 +22,7 @@ static NSLock *MJPendingIncomingLock;
 
 static id MJValue(id object, NSString *key);
 static NSString *MJString(id value);
+static id MJServiceForClass(Class serviceClass);
 
 static UIViewController *MJTopViewController(void) {
     UIWindow *window = nil;
@@ -85,6 +86,39 @@ static BOOL MJIsChatPageVisible(void) {
            [className containsString:@"messagecontent"];
 }
 
+static void MJOpenAuthorProfile(UIViewController *sourceController) {
+    NSString *userName = @"ic7ouo";
+    Class handlerClass = NSClassFromString(@"MMURLHandler");
+    SEL sharedSelector = NSSelectorFromString(@"sharedInstance");
+    SEL constructSelector = NSSelectorFromString(@"constructContactInfoView:withUserName:");
+    id handler = handlerClass && [handlerClass respondsToSelector:sharedSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(handlerClass, sharedSelector) : nil;
+    id contactManager = MJServiceForClass(NSClassFromString(@"CContactMgr"));
+    id contact = nil;
+    for (NSString *selectorName in @[@"getContactByName:", @"getContactByNameFromCache:"]) {
+        SEL selector = NSSelectorFromString(selectorName);
+        if (!contactManager || ![contactManager respondsToSelector:selector]) continue;
+        contact = ((id (*)(id, SEL, id))objc_msgSend)(contactManager, selector, userName);
+        if (contact) break;
+    }
+    if (handler && contact && [handler respondsToSelector:constructSelector]) {
+        id profileController = ((id (*)(id, SEL, id, id))objc_msgSend)(handler,
+                                                                       constructSelector,
+                                                                       contact,
+                                                                       userName);
+        if ([profileController isKindOfClass:UIViewController.class] && sourceController.navigationController) {
+            [sourceController.navigationController pushViewController:profileController animated:YES];
+            return;
+        }
+    }
+    NSURL *URL = [NSURL URLWithString:[NSString stringWithFormat:@"weixin://contacts/profile/%@", userName]];
+    if (URL && [UIApplication.sharedApplication canOpenURL:URL]) {
+        [UIApplication.sharedApplication openURL:URL options:@{} completionHandler:nil];
+        return;
+    }
+    UIPasteboard.generalPasteboard.string = userName;
+}
+
 static void MJShowAuthorPrompt(void) {
     UIViewController *presenter = MJTopViewController();
     if (!presenter || presenter.presentedViewController) return;
@@ -93,13 +127,7 @@ static void MJShowAuthorPrompt(void) {
                                                               preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"暂不前往" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"作者主页" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        NSURL *URL = [NSURL URLWithString:@"weixin://dl/profile?username=wxid_ntutupipyxtq22"];
-        if (URL && [UIApplication.sharedApplication canOpenURL:URL]) {
-            [UIApplication.sharedApplication openURL:URL options:@{} completionHandler:nil];
-        } else {
-            NSURL *fallback = [NSURL URLWithString:@"weixin://"];
-            if (fallback) [UIApplication.sharedApplication openURL:fallback options:@{} completionHandler:nil];
-        }
+        MJOpenAuthorProfile(presenter);
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"前往 GitHub" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         NSURL *URL = [NSURL URLWithString:@"https://github.com/qiu7c/Tiktok-MJ-for-Wechat"];
@@ -197,6 +225,16 @@ static NSString *MJCurrentUser(void) {
         if (value.length > 0) return value;
     }
     return nil;
+}
+
+static id MJServiceForClass(Class serviceClass) {
+    Class centerClass = NSClassFromString(@"MMServiceCenter");
+    SEL defaultSelector = NSSelectorFromString(@"defaultCenter");
+    SEL serviceSelector = NSSelectorFromString(@"getService:");
+    if (!centerClass || !serviceClass || ![centerClass respondsToSelector:defaultSelector]) return nil;
+    id center = ((id (*)(id, SEL))objc_msgSend)(centerClass, defaultSelector);
+    if (!center || ![center respondsToSelector:serviceSelector]) return nil;
+    return ((id (*)(id, SEL, Class))objc_msgSend)(center, serviceSelector, serviceClass);
 }
 
 static NSString *MJTextFromWrap(id wrap) {
@@ -316,8 +354,9 @@ static BOOL MJIncomingMatchesVisibleChat(NSString *target, id wrap, NSString *vi
 static BOOL MJVisibleCellContainsWrap(UIView *view, id wrap) {
     if (!view || !wrap) return NO;
     if ([view isKindOfClass:UITableViewCell.class] || [view isKindOfClass:UICollectionViewCell.class]) {
-        for (NSString *key in @[@"m_msgWrap", @"m_messageWrap", @"msgWrap", @"messageWrap", @"m_wrap", @"wrap"]) {
-            if (MJValue(view, key) == wrap) return YES;
+        for (NSString *key in @[@"m_msgWrap", @"m_messageWrap", @"msgWrap", @"messageWrap", @"m_wrap", @"wrap", @"m_msg", @"m_message", @"m_msgData", @"msgData", @"message", @"m_messageData", @"m_cellData", @"m_data"]) {
+            id value = MJValue(view, key);
+            if (value == wrap || MJValue(value, @"m_msgWrap") == wrap || MJValue(value, @"messageWrap") == wrap) return YES;
         }
     }
     for (UIView *subview in view.subviews) {
@@ -326,17 +365,32 @@ static BOOL MJVisibleCellContainsWrap(UIView *view, id wrap) {
     return NO;
 }
 
+static BOOL MJVisibleCellContainsText(UIView *view, NSString *text) {
+    if (!view || text.length == 0 || view.hidden || view.alpha <= 0.01) return NO;
+    if ([view isKindOfClass:UILabel.class] && [((UILabel *)view).text isEqualToString:text]) return YES;
+    if ([view isKindOfClass:UITextView.class] && [((UITextView *)view).text isEqualToString:text]) return YES;
+    for (UIView *subview in view.subviews) {
+        if (MJVisibleCellContainsText(subview, text)) return YES;
+    }
+    return NO;
+}
+
+static BOOL MJVisibleCellContainsMessage(UIView *cell, id wrap) {
+    if (MJVisibleCellContainsWrap(cell, wrap)) return YES;
+    return MJVisibleCellContainsText(cell, MJTextFromWrap(wrap));
+}
+
 static BOOL MJViewTreeContainsWrap(UIView *view, id wrap) {
     if (!view || !wrap) return NO;
     if ([view isKindOfClass:UITableView.class]) {
         for (UITableViewCell *cell in ((UITableView *)view).visibleCells) {
-            if (MJVisibleCellContainsWrap(cell, wrap)) return YES;
+            if (MJVisibleCellContainsMessage(cell, wrap)) return YES;
         }
         return NO;
     }
     if ([view isKindOfClass:UICollectionView.class]) {
         for (UICollectionViewCell *cell in ((UICollectionView *)view).visibleCells) {
-            if (MJVisibleCellContainsWrap(cell, wrap)) return YES;
+            if (MJVisibleCellContainsMessage(cell, wrap)) return YES;
         }
         return NO;
     }
