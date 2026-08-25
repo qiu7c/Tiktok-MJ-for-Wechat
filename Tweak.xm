@@ -13,12 +13,13 @@
 @interface CMessageWrap : NSObject
 @end
 
-static char MJIncomingHandledKey;
+static char MJIncomingCheckPendingKey;
 static char MJOutgoingTimestampKey;
 static BOOL MJLastEnabledState;
 static UIAlertController *MJAssetInitializationAlert;
-static NSMutableDictionary<NSString *, NSMutableArray *> *MJPendingIncoming;
-static NSLock *MJPendingIncomingLock;
+static NSMutableDictionary<NSString *, NSNumber *> *MJPendingIncoming;
+static NSMutableDictionary<NSString *, NSNumber *> *MJConsumedIncoming;
+static NSLock *MJIncomingLock;
 
 static id MJValue(id object, NSString *key);
 static NSString *MJString(id value);
@@ -55,35 +56,6 @@ static UIViewController *MJTopViewController(void) {
         controller = ((UITabBarController *)controller).selectedViewController;
     }
     return controller;
-}
-
-static NSString *MJControllerChatUser(UIViewController *controller) {
-    if (!controller) return nil;
-    NSString *className = NSStringFromClass(controller.class).lowercaseString;
-    if (![className containsString:@"msgcontent"] &&
-        ![className containsString:@"chatroom"] &&
-        ![className containsString:@"messagecontent"]) return nil;
-    for (NSString *key in @[@"m_nsUsr", @"m_nsUserName", @"m_nsToUsr", @"m_nsChatRoomUsr", @"m_chatRoomUsr", @"username", @"userName"]) {
-        NSString *value = MJString(MJValue(controller, key));
-        if (value.length > 0) return value;
-    }
-    for (NSString *key in @[@"m_contact", @"contact", @"m_chatContact"]) {
-        id contact = MJValue(controller, key);
-        for (NSString *contactKey in @[@"m_nsUsr", @"m_nsUserName", @"username", @"userName"]) {
-            NSString *value = MJString(MJValue(contact, contactKey));
-            if (value.length > 0) return value;
-        }
-    }
-    return nil;
-}
-
-static BOOL MJIsChatPageVisible(void) {
-    UIViewController *controller = MJTopViewController();
-    if (!controller) return NO;
-    NSString *className = NSStringFromClass(controller.class).lowercaseString;
-    return [className containsString:@"msgcontent"] ||
-           [className containsString:@"chatroom"] ||
-           [className containsString:@"messagecontent"];
 }
 
 static void MJOpenAuthorProfile(UIViewController *sourceController) {
@@ -268,47 +240,83 @@ static BOOL MJIncomingWrap(id wrap) {
     return ![from isEqualToString:current] && ![real isEqualToString:current];
 }
 
-static void MJQueueIncoming(NSString *target, id wrap) {
-    if (target.length == 0 || !wrap) return;
-    if (!MJPendingIncoming) MJPendingIncoming = [NSMutableDictionary dictionary];
-    if (!MJPendingIncomingLock) MJPendingIncomingLock = [NSLock new];
-    [MJPendingIncomingLock lock];
-    NSMutableArray *items = MJPendingIncoming[target];
-    if (!items) {
-        items = [NSMutableArray array];
-        MJPendingIncoming[target] = items;
-    }
-    if (![items containsObject:wrap]) [items addObject:wrap];
-    [MJPendingIncomingLock unlock];
-}
-
-static void MJDrainAllIncoming(void) {
-    if (!MJPendingIncomingLock) return;
-    [MJPendingIncomingLock lock];
-    NSMutableArray *items = [NSMutableArray array];
-    for (NSArray *pending in MJPendingIncoming.allValues) [items addObjectsFromArray:pending];
-    [MJPendingIncoming removeAllObjects];
-    [MJPendingIncomingLock unlock];
-    for (id wrap in items) {
-        if (![objc_getAssociatedObject(wrap, &MJIncomingHandledKey) boolValue]) {
-            objc_setAssociatedObject(wrap, &MJIncomingHandledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            MJPlayEasterEgg();
+static NSArray<NSString *> *MJMessageIdentities(id wrap) {
+    if (!wrap) return @[];
+    NSMutableOrderedSet<NSString *> *identities = [NSMutableOrderedSet orderedSet];
+    SEL combinedSelector = NSSelectorFromString(@"combineChatNameWithLocalId");
+    if ([wrap respondsToSelector:combinedSelector]) {
+        id combined = ((id (*)(id, SEL))objc_msgSend)(wrap, combinedSelector);
+        if ([combined isKindOfClass:NSString.class] && [combined length] > 0) {
+            [identities addObject:[@"combined:" stringByAppendingString:combined]];
         }
     }
+
+    NSString *chatName = nil;
+    SEL chatSelector = NSSelectorFromString(@"GetChatName");
+    if ([wrap respondsToSelector:chatSelector]) {
+        id value = ((id (*)(id, SEL))objc_msgSend)(wrap, chatSelector);
+        if ([value isKindOfClass:NSString.class]) chatName = value;
+    }
+    unsigned long long localID = [MJValue(wrap, @"m_uiMesLocalID") unsignedLongLongValue];
+    long long serverID = [MJValue(wrap, @"m_n64MesSvrID") longLongValue];
+    if (chatName.length > 0 && localID > 0) {
+        [identities addObject:[NSString stringWithFormat:@"local:%@:%llu", chatName, localID]];
+    }
+    if (chatName.length > 0 && serverID != 0) {
+        [identities addObject:[NSString stringWithFormat:@"server:%@:%lld", chatName, serverID]];
+    }
+    return identities.array;
 }
 
-static void MJDrainIncomingForChat(NSString *target) {
-    if (target.length == 0 || !MJPendingIncomingLock) return;
-    [MJPendingIncomingLock lock];
-    NSArray *items = [MJPendingIncoming[target] copy];
-    [MJPendingIncoming removeObjectForKey:target];
-    [MJPendingIncomingLock unlock];
-    for (id wrap in items) {
-        if (![objc_getAssociatedObject(wrap, &MJIncomingHandledKey) boolValue]) {
-            objc_setAssociatedObject(wrap, &MJIncomingHandledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            MJPlayEasterEgg();
+static void MJPruneIncomingLocked(NSTimeInterval now) {
+    const NSTimeInterval pendingTTL = 300.0;
+    const NSTimeInterval consumedTTL = 600.0;
+    for (NSString *key in MJPendingIncoming.allKeys) {
+        if (now - MJPendingIncoming[key].doubleValue > pendingTTL) [MJPendingIncoming removeObjectForKey:key];
+    }
+    for (NSString *key in MJConsumedIncoming.allKeys) {
+        if (now - MJConsumedIncoming[key].doubleValue > consumedTTL) [MJConsumedIncoming removeObjectForKey:key];
+    }
+}
+
+static void MJRegisterIncoming(id wrap) {
+    if (![NSUserDefaults.standardUserDefaults boolForKey:MJEnabledKey] ||
+        [MJValue(wrap, @"m_uiMessageType") integerValue] != 1 ||
+        !MJIncomingWrap(wrap) || !MJMatches(wrap)) return;
+    NSArray<NSString *> *identities = MJMessageIdentities(wrap);
+    if (identities.count == 0) return;
+
+    [MJIncomingLock lock];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    MJPruneIncomingLocked(now);
+    for (NSString *identity in identities) {
+        if (MJConsumedIncoming[identity]) {
+            [MJIncomingLock unlock];
+            return;
         }
     }
+    for (NSString *identity in identities) MJPendingIncoming[identity] = @(now);
+    [MJIncomingLock unlock];
+}
+
+static BOOL MJConsumeIncoming(id wrap) {
+    NSArray<NSString *> *identities = MJMessageIdentities(wrap);
+    if (identities.count == 0 || !MJIncomingLock) return NO;
+    [MJIncomingLock lock];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    MJPruneIncomingLocked(now);
+    BOOL pending = NO;
+    for (NSString *identity in identities) {
+        if (MJPendingIncoming[identity]) { pending = YES; break; }
+    }
+    if (pending) {
+        for (NSString *identity in identities) {
+            [MJPendingIncoming removeObjectForKey:identity];
+            MJConsumedIncoming[identity] = @(now);
+        }
+    }
+    [MJIncomingLock unlock];
+    return pending;
 }
 
 static void MJTriggerOutgoing(id sender, id text) {
@@ -320,119 +328,38 @@ static void MJTriggerOutgoing(id sender, id text) {
     MJPlayEasterEgg();
 }
 
-static void MJTriggerIncoming(id wrap) {
-    if (![NSUserDefaults.standardUserDefaults boolForKey:MJEnabledKey] || !wrap ||
-        [objc_getAssociatedObject(wrap, &MJIncomingHandledKey) boolValue]) return;
-    if ([MJValue(wrap, @"m_uiMessageType") integerValue] != 1 || !MJIncomingWrap(wrap) || !MJMatches(wrap)) return;
-    objc_setAssociatedObject(wrap, &MJIncomingHandledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    MJPlayEasterEgg();
+static id MJMessageWrapForCell(id cell) {
+    id viewModel = MJValue(cell, @"viewModel") ?: MJValue(cell, @"m_viewModel");
+    id wrap = MJValue(viewModel, @"messageWrap") ?: MJValue(viewModel, @"m_messageWrap") ?:
+              MJValue(viewModel, @"msgWrap") ?: MJValue(viewModel, @"wrap");
+    if (wrap) return wrap;
+    id parentModel = MJValue(viewModel, @"parentModel");
+    return MJValue(parentModel, @"messageWrap") ?: MJValue(parentModel, @"m_messageWrap") ?:
+           MJValue(parentModel, @"msgWrap") ?: MJValue(parentModel, @"wrap");
 }
 
-static NSString *MJIncomingChatCandidate(NSString *target, id wrap, NSString *visibleChat) {
-    NSArray *candidates = @[target ?: @"",
-                            MJString(MJValue(wrap, @"m_nsFromUsr")) ?: @"",
-                            MJString(MJValue(wrap, @"m_nsRealChatUsr")) ?: @"",
-                            MJString(MJValue(wrap, @"m_nsToUsr")) ?: @"",
-                            MJString(MJValue(wrap, @"m_nsChatRoomUsr")) ?: @""];
-    for (NSString *candidate in candidates) {
-        if (candidate.length > 0 && [candidate isEqualToString:visibleChat]) return candidate;
-    }
-    for (NSString *candidate in candidates) if (candidate.length > 0) return candidate;
-    return nil;
-}
-
-static BOOL MJIncomingMatchesVisibleChat(NSString *target, id wrap, NSString *visibleChat) {
-    if (visibleChat.length == 0) return NO;
-    NSArray *candidates = @[target ?: @"",
-                            MJString(MJValue(wrap, @"m_nsFromUsr")) ?: @"",
-                            MJString(MJValue(wrap, @"m_nsRealChatUsr")) ?: @"",
-                            MJString(MJValue(wrap, @"m_nsToUsr")) ?: @"",
-                            MJString(MJValue(wrap, @"m_nsChatRoomUsr")) ?: @""];
-    return [candidates containsObject:visibleChat];
-}
-
-static BOOL MJVisibleCellContainsWrap(UIView *view, id wrap) {
-    if (!view || !wrap) return NO;
-    if ([view isKindOfClass:UITableViewCell.class] || [view isKindOfClass:UICollectionViewCell.class]) {
-        for (NSString *key in @[@"m_msgWrap", @"m_messageWrap", @"msgWrap", @"messageWrap", @"m_wrap", @"wrap", @"m_msg", @"m_message", @"m_msgData", @"msgData", @"message", @"m_messageData", @"m_cellData", @"m_data"]) {
-            id value = MJValue(view, key);
-            if (value == wrap || MJValue(value, @"m_msgWrap") == wrap || MJValue(value, @"messageWrap") == wrap) return YES;
-        }
-    }
-    for (UIView *subview in view.subviews) {
-        if (MJVisibleCellContainsWrap(subview, wrap)) return YES;
-    }
-    return NO;
-}
-
-static BOOL MJVisibleCellContainsText(UIView *view, NSString *text) {
-    if (!view || text.length == 0 || view.hidden || view.alpha <= 0.01) return NO;
-    if ([view isKindOfClass:UILabel.class] && [((UILabel *)view).text isEqualToString:text]) return YES;
-    if ([view isKindOfClass:UITextView.class] && [((UITextView *)view).text isEqualToString:text]) return YES;
-    for (UIView *subview in view.subviews) {
-        if (MJVisibleCellContainsText(subview, text)) return YES;
-    }
-    return NO;
-}
-
-static BOOL MJVisibleCellContainsMessage(UIView *cell, id wrap) {
-    if (MJVisibleCellContainsWrap(cell, wrap)) return YES;
-    return MJVisibleCellContainsText(cell, MJTextFromWrap(wrap));
-}
-
-static BOOL MJViewTreeContainsWrap(UIView *view, id wrap) {
-    if (!view || !wrap) return NO;
-    if ([view isKindOfClass:UITableView.class]) {
-        for (UITableViewCell *cell in ((UITableView *)view).visibleCells) {
-            if (MJVisibleCellContainsMessage(cell, wrap)) return YES;
-        }
-        return NO;
-    }
-    if ([view isKindOfClass:UICollectionView.class]) {
-        for (UICollectionViewCell *cell in ((UICollectionView *)view).visibleCells) {
-            if (MJVisibleCellContainsMessage(cell, wrap)) return YES;
-        }
-        return NO;
-    }
-    for (UIView *subview in view.subviews) {
-        if (MJViewTreeContainsWrap(subview, wrap)) return YES;
-    }
-    return NO;
-}
-
-static BOOL MJVisiblePageContainsWrap(id wrap) {
-    if (!MJIsChatPageVisible() || !wrap) return NO;
-    UIViewController *controller = MJTopViewController();
-    return MJViewTreeContainsWrap(controller.view, wrap);
-}
-
-static void MJWaitForVisibleIncoming(id wrap, NSString *chat, NSUInteger attempt) {
-    if (!wrap || !MJIsChatPageVisible()) return;
-    if (MJVisiblePageContainsWrap(wrap)) {
-        MJTriggerIncoming(wrap);
-        return;
-    }
-    if (attempt >= 8) {
-        if (MJIsChatPageVisible()) MJTriggerIncoming(wrap);
-        else MJQueueIncoming(chat, wrap);
-        return;
-    }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        MJWaitForVisibleIncoming(wrap, chat, attempt + 1);
-    });
-}
-
-static void MJScheduleIncoming(NSString *target, id wrap) {
-    if (!wrap || [MJValue(wrap, @"m_uiMessageType") integerValue] != 1 ||
+static void MJCheckIncomingCell(UIView *cell) {
+    if (!cell.window || ![NSUserDefaults.standardUserDefaults boolForKey:MJEnabledKey]) return;
+    id wrap = MJMessageWrapForCell(cell);
+    if ([MJValue(wrap, @"m_uiMessageType") integerValue] != 1 ||
         !MJIncomingWrap(wrap) || !MJMatches(wrap)) return;
+    if (MJConsumeIncoming(wrap)) MJPlayEasterEgg();
+}
+
+static void MJScheduleIncomingCellCheck(UIView *cell) {
+    if (!cell || [objc_getAssociatedObject(cell, &MJIncomingCheckPendingKey) boolValue]) return;
+    objc_setAssociatedObject(cell, &MJIncomingCheckPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UIView *weakCell = cell;
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSString *visibleChat = MJControllerChatUser(MJTopViewController());
-        NSString *chat = MJIncomingChatCandidate(target, wrap, visibleChat);
-        BOOL sameChat = MJIncomingMatchesVisibleChat(target, wrap, visibleChat);
-        if (sameChat) MJTriggerIncoming(wrap);
-        else if (MJIsChatPageVisible()) MJWaitForVisibleIncoming(wrap, chat, 0);
-        else MJQueueIncoming(chat, wrap);
+        UIView *strongCell = weakCell;
+        if (!strongCell) return;
+        MJCheckIncomingCell(strongCell);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIView *delayedCell = weakCell;
+            if (!delayedCell) return;
+            objc_setAssociatedObject(delayedCell, &MJIncomingCheckPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            MJCheckIncomingCell(delayedCell);
+        });
     });
 }
 
@@ -449,41 +376,54 @@ static void MJScheduleIncoming(NSString *target, id wrap) {
 
 %hook CMessageMgr
 - (void)AddMsg:(NSString *)target MsgWrap:(CMessageWrap *)wrap {
+    MJRegisterIncoming(wrap);
     %orig(target, wrap);
-    MJScheduleIncoming(target, wrap);
 }
 - (void)onNewSyncAddMessage:(id)wrap {
+    MJRegisterIncoming(wrap);
     %orig(wrap);
-    MJScheduleIncoming(nil, wrap);
 }
 - (void)AsyncOnPreAddMsg:(id)first MsgWrap:(id)second {
+    MJRegisterIncoming(second ?: first);
     %orig(first, second);
-    MJScheduleIncoming(nil, second ?: first);
 }
 - (void)AsyncOnAddMsg:(id)first MsgWrap:(id)second {
+    MJRegisterIncoming(second ?: first);
     %orig(first, second);
-    MJScheduleIncoming(nil, second ?: first);
 }
 - (void)AsyncOnAddMsgForSession:(id)session MsgWrap:(id)wrap {
+    MJRegisterIncoming(wrap ?: session);
     %orig(session, wrap);
-    MJScheduleIncoming(nil, wrap ?: session);
 }
 - (void)AsyncOnAddMsgForSession:(id)session MsgWrap:(id)wrap NewMsgArriveNotify:(BOOL)notify {
+    MJRegisterIncoming(wrap ?: session);
     %orig(session, wrap, notify);
-    MJScheduleIncoming(nil, wrap ?: session);
 }
 %end
 
-%hook BaseMsgContentViewController
-- (void)viewDidAppear:(BOOL)animated {
-    %orig(animated);
-    NSString *chat = MJControllerChatUser((UIViewController *)self);
-    if (chat.length > 0) MJDrainIncomingForChat(chat);
-    else MJDrainAllIncoming();
+%hook CommonMessageCellView
+- (void)setViewModel:(id)viewModel {
+    %orig(viewModel);
+    MJScheduleIncomingCellCheck(self);
+}
+- (void)updateStatus {
+    %orig;
+    MJScheduleIncomingCellCheck(self);
+}
+- (void)updateNodeStatus {
+    %orig;
+    MJScheduleIncomingCellCheck(self);
+}
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window) MJScheduleIncomingCellCheck(self);
 }
 %end
 
 %ctor {
+    MJIncomingLock = [NSLock new];
+    MJPendingIncoming = [NSMutableDictionary dictionary];
+    MJConsumedIncoming = [NSMutableDictionary dictionary];
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSUserDefaults.standardUserDefaults registerDefaults:@{MJEnabledKey: @YES}];
         MJInstallEnablePrompt();
