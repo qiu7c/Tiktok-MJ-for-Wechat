@@ -1,0 +1,44 @@
+name: Build Tiktok MJ for WeChat
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    name: Build (${{ matrix.scheme }})
+    runs-on: macos-15
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scheme: rootful
+            make_args: ""
+          - scheme: rootless
+            make_args: "THEOS_PACKAGE_SCHEME=rootless"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Theos
+        run: |
+          brew install ldid
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          git clone --depth 1 https://github.com/theos/sdks.git "$RUNNER_TEMP/theos-sdks"
+          cp -R "$RUNNER_TEMP"/theos-sdks/*.sdk "$THEOS/sdks/"
+
+      - name: Build package
+        run: make clean package FINALPACKAGE=1 ${{ matrix.make_args }}
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: TiktokMJ-${{ matrix.scheme }}
+          path: packages/*.deb
+          if-no-files-found: error
