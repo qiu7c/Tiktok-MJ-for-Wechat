@@ -326,28 +326,30 @@ static BOOL MJVisibleCellContainsWrap(UIView *view, id wrap) {
     return NO;
 }
 
+static BOOL MJViewTreeContainsWrap(UIView *view, id wrap) {
+    if (!view || !wrap) return NO;
+    if ([view isKindOfClass:UITableView.class]) {
+        for (UITableViewCell *cell in ((UITableView *)view).visibleCells) {
+            if (MJVisibleCellContainsWrap(cell, wrap)) return YES;
+        }
+        return NO;
+    }
+    if ([view isKindOfClass:UICollectionView.class]) {
+        for (UICollectionViewCell *cell in ((UICollectionView *)view).visibleCells) {
+            if (MJVisibleCellContainsWrap(cell, wrap)) return YES;
+        }
+        return NO;
+    }
+    for (UIView *subview in view.subviews) {
+        if (MJViewTreeContainsWrap(subview, wrap)) return YES;
+    }
+    return NO;
+}
+
 static BOOL MJVisiblePageContainsWrap(id wrap) {
     if (!MJIsChatPageVisible() || !wrap) return NO;
     UIViewController *controller = MJTopViewController();
-    __block BOOL found = NO;
-    __block void (^visit)(UIView *);
-    visit = ^(UIView *view) {
-        if (!view || found) return;
-        if ([view isKindOfClass:UITableView.class]) {
-            for (UITableViewCell *cell in ((UITableView *)view).visibleCells) {
-                if (MJVisibleCellContainsWrap(cell, wrap)) { found = YES; return; }
-            }
-            return;
-        } else if ([view isKindOfClass:UICollectionView.class]) {
-            for (UICollectionViewCell *cell in ((UICollectionView *)view).visibleCells) {
-                if (MJVisibleCellContainsWrap(cell, wrap)) { found = YES; return; }
-            }
-            return;
-        }
-        for (UIView *subview in view.subviews) visit(subview);
-    };
-    visit(controller.view);
-    return found;
+    return MJViewTreeContainsWrap(controller.view, wrap);
 }
 
 static void MJWaitForVisibleIncoming(id wrap, NSString *chat, NSUInteger attempt) {
