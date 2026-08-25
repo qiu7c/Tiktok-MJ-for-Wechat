@@ -15,7 +15,6 @@
 
 static char MJIncomingHandledKey;
 static char MJOutgoingTimestampKey;
-static char MJAuthorSearchLogicKey;
 static BOOL MJLastEnabledState;
 static UIAlertController *MJAssetInitializationAlert;
 static NSMutableDictionary<NSString *, NSMutableArray *> *MJPendingIncoming;
@@ -46,17 +45,14 @@ static UIViewController *MJTopViewController(void) {
         }
     }
     UIViewController *controller = window.rootViewController;
-    while (controller) {
-        UIViewController *next = nil;
-        if (controller.presentedViewController && !controller.presentedViewController.isBeingDismissed) {
-            next = controller.presentedViewController;
-        } else if ([controller isKindOfClass:UINavigationController.class]) {
-            next = ((UINavigationController *)controller).visibleViewController;
-        } else if ([controller isKindOfClass:UITabBarController.class]) {
-            next = ((UITabBarController *)controller).selectedViewController;
-        }
-        if (!next || next == controller) break;
-        controller = next;
+    while (controller.presentedViewController && !controller.presentedViewController.isBeingDismissed) {
+        controller = controller.presentedViewController;
+    }
+    while ([controller isKindOfClass:UINavigationController.class] && ((UINavigationController *)controller).visibleViewController) {
+        controller = ((UINavigationController *)controller).visibleViewController;
+    }
+    while ([controller isKindOfClass:UITabBarController.class] && ((UITabBarController *)controller).selectedViewController) {
+        controller = ((UITabBarController *)controller).selectedViewController;
     }
     return controller;
 }
@@ -114,23 +110,6 @@ static void MJOpenAuthorProfile(UIViewController *sourceController) {
             [sourceController.navigationController pushViewController:profileController animated:YES];
             return;
         }
-    }
-    Class searchClass = NSClassFromString(@"GetA8KeyLogic");
-    SEL initializer = NSSelectorFromString(@"initWithViewController:delegate:");
-    SEL searchSelector = NSSelectorFromString(@"doSearchContact:FromScene:SearchScene:picUrl:");
-    id searchLogic = searchClass && [searchClass instancesRespondToSelector:initializer]
-        ? ((id (*)(id, SEL, id, id))objc_msgSend)([searchClass alloc], initializer, sourceController, nil)
-        : nil;
-    if (searchLogic && [searchLogic respondsToSelector:searchSelector]) {
-        objc_setAssociatedObject(sourceController, &MJAuthorSearchLogicKey,
-                                 searchLogic, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        ((void (*)(id, SEL, id, NSUInteger, NSUInteger, id))objc_msgSend)(searchLogic,
-                                                                          searchSelector,
-                                                                          userName,
-                                                                          0,
-                                                                          0,
-                                                                          nil);
-        return;
     }
     NSURL *URL = [NSURL URLWithString:[NSString stringWithFormat:@"weixin://contacts/profile/%@", userName]];
     if (URL && [UIApplication.sharedApplication canOpenURL:URL]) {
@@ -285,15 +264,8 @@ static BOOL MJIncomingWrap(id wrap) {
     NSString *current = MJCurrentUser();
     NSString *from = MJString(MJValue(wrap, @"m_nsFromUsr"));
     NSString *real = MJString(MJValue(wrap, @"m_nsRealChatUsr"));
-    NSString *to = MJString(MJValue(wrap, @"m_nsToUsr"));
-    NSString *chatRoom = MJString(MJValue(wrap, @"m_nsChatRoomUsr"));
-    if (current.length == 0) return NO;
-    BOOL group = [from containsString:@"@chatroom"] ||
-                 [to containsString:@"@chatroom"] ||
-                 [chatRoom containsString:@"@chatroom"];
-    NSString *sender = group ? real : from;
-    if (sender.length == 0 && ![from containsString:@"@chatroom"]) sender = from;
-    return sender.length > 0 && ![sender isEqualToString:current];
+    if (current.length == 0 || (from.length == 0 && real.length == 0)) return NO;
+    return ![from isEqualToString:current] && ![real isEqualToString:current];
 }
 
 static void MJQueueIncoming(NSString *target, id wrap) {
@@ -308,6 +280,21 @@ static void MJQueueIncoming(NSString *target, id wrap) {
     }
     if (![items containsObject:wrap]) [items addObject:wrap];
     [MJPendingIncomingLock unlock];
+}
+
+static void MJDrainAllIncoming(void) {
+    if (!MJPendingIncomingLock) return;
+    [MJPendingIncomingLock lock];
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSArray *pending in MJPendingIncoming.allValues) [items addObjectsFromArray:pending];
+    [MJPendingIncoming removeAllObjects];
+    [MJPendingIncomingLock unlock];
+    for (id wrap in items) {
+        if (![objc_getAssociatedObject(wrap, &MJIncomingHandledKey) boolValue]) {
+            objc_setAssociatedObject(wrap, &MJIncomingHandledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            MJPlayEasterEgg();
+        }
+    }
 }
 
 static void MJDrainIncomingForChat(NSString *target) {
@@ -342,18 +329,15 @@ static void MJTriggerIncoming(id wrap) {
 }
 
 static NSString *MJIncomingChatCandidate(NSString *target, id wrap, NSString *visibleChat) {
-    NSArray *candidates = @[MJString(MJValue(wrap, @"m_nsFromUsr")) ?: @"",
-                            MJString(MJValue(wrap, @"m_nsChatRoomUsr")) ?: @"",
-                            target ?: @"",
+    NSArray *candidates = @[target ?: @"",
+                            MJString(MJValue(wrap, @"m_nsFromUsr")) ?: @"",
                             MJString(MJValue(wrap, @"m_nsRealChatUsr")) ?: @"",
-                            MJString(MJValue(wrap, @"m_nsToUsr")) ?: @""];
+                            MJString(MJValue(wrap, @"m_nsToUsr")) ?: @"",
+                            MJString(MJValue(wrap, @"m_nsChatRoomUsr")) ?: @""];
     for (NSString *candidate in candidates) {
         if (candidate.length > 0 && [candidate isEqualToString:visibleChat]) return candidate;
     }
-    NSString *current = MJCurrentUser();
-    for (NSString *candidate in candidates) {
-        if (candidate.length > 0 && ![candidate isEqualToString:current]) return candidate;
-    }
+    for (NSString *candidate in candidates) if (candidate.length > 0) return candidate;
     return nil;
 }
 
@@ -422,24 +406,6 @@ static BOOL MJVisiblePageContainsWrap(id wrap) {
     return MJViewTreeContainsWrap(controller.view, wrap);
 }
 
-static void MJDrainVisibleIncoming(void) {
-    if (!MJPendingIncomingLock || !MJIsChatPageVisible()) return;
-    [MJPendingIncomingLock lock];
-    NSDictionary *snapshot = [MJPendingIncoming copy];
-    [MJPendingIncomingLock unlock];
-    [snapshot enumerateKeysAndObjectsUsingBlock:^(NSString *chat, NSArray *items, __unused BOOL *stop) {
-        for (id wrap in items) {
-            if (!MJVisiblePageContainsWrap(wrap)) continue;
-            [MJPendingIncomingLock lock];
-            NSMutableArray *pending = MJPendingIncoming[chat];
-            [pending removeObject:wrap];
-            if (pending.count == 0) [MJPendingIncoming removeObjectForKey:chat];
-            [MJPendingIncomingLock unlock];
-            MJTriggerIncoming(wrap);
-        }
-    }];
-}
-
 static void MJWaitForVisibleIncoming(id wrap, NSString *chat, NSUInteger attempt) {
     if (!wrap || !MJIsChatPageVisible()) return;
     if (MJVisiblePageContainsWrap(wrap)) {
@@ -447,7 +413,8 @@ static void MJWaitForVisibleIncoming(id wrap, NSString *chat, NSUInteger attempt
         return;
     }
     if (attempt >= 8) {
-        MJQueueIncoming(chat, wrap);
+        if (MJIsChatPageVisible()) MJTriggerIncoming(wrap);
+        else MJQueueIncoming(chat, wrap);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
@@ -512,8 +479,7 @@ static void MJScheduleIncoming(NSString *target, id wrap) {
     %orig(animated);
     NSString *chat = MJControllerChatUser((UIViewController *)self);
     if (chat.length > 0) MJDrainIncomingForChat(chat);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ MJDrainVisibleIncoming(); });
+    else MJDrainAllIncoming();
 }
 %end
 
