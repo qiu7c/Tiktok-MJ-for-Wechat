@@ -20,10 +20,10 @@ static UIAlertController *MJAssetInitializationAlert;
 static NSMutableDictionary<NSString *, NSNumber *> *MJPendingIncoming;
 static NSMutableDictionary<NSString *, NSNumber *> *MJConsumedIncoming;
 static NSLock *MJIncomingLock;
+static NSHashTable<UIView *> *MJVisibleMessageCells;
 
 static id MJValue(id object, NSString *key);
 static NSString *MJString(id value);
-static id MJServiceForClass(Class serviceClass);
 
 static UIViewController *MJTopViewController(void) {
     UIWindow *window = nil;
@@ -58,39 +58,6 @@ static UIViewController *MJTopViewController(void) {
     return controller;
 }
 
-static void MJOpenAuthorProfile(UIViewController *sourceController) {
-    NSString *userName = @"ic7ouo";
-    Class handlerClass = NSClassFromString(@"MMURLHandler");
-    SEL sharedSelector = NSSelectorFromString(@"sharedInstance");
-    SEL constructSelector = NSSelectorFromString(@"constructContactInfoView:withUserName:");
-    id handler = handlerClass && [handlerClass respondsToSelector:sharedSelector]
-        ? ((id (*)(id, SEL))objc_msgSend)(handlerClass, sharedSelector) : nil;
-    id contactManager = MJServiceForClass(NSClassFromString(@"CContactMgr"));
-    id contact = nil;
-    for (NSString *selectorName in @[@"getContactByName:", @"getContactByNameFromCache:"]) {
-        SEL selector = NSSelectorFromString(selectorName);
-        if (!contactManager || ![contactManager respondsToSelector:selector]) continue;
-        contact = ((id (*)(id, SEL, id))objc_msgSend)(contactManager, selector, userName);
-        if (contact) break;
-    }
-    if (handler && contact && [handler respondsToSelector:constructSelector]) {
-        id profileController = ((id (*)(id, SEL, id, id))objc_msgSend)(handler,
-                                                                       constructSelector,
-                                                                       contact,
-                                                                       userName);
-        if ([profileController isKindOfClass:UIViewController.class] && sourceController.navigationController) {
-            [sourceController.navigationController pushViewController:profileController animated:YES];
-            return;
-        }
-    }
-    NSURL *URL = [NSURL URLWithString:[NSString stringWithFormat:@"weixin://contacts/profile/%@", userName]];
-    if (URL && [UIApplication.sharedApplication canOpenURL:URL]) {
-        [UIApplication.sharedApplication openURL:URL options:@{} completionHandler:nil];
-        return;
-    }
-    UIPasteboard.generalPasteboard.string = userName;
-}
-
 static void MJShowAuthorPrompt(void) {
     UIViewController *presenter = MJTopViewController();
     if (!presenter || presenter.presentedViewController) return;
@@ -98,9 +65,6 @@ static void MJShowAuthorPrompt(void) {
                                                                      message:@"作者：qiu7c\n如若要卸载插件，请先将插件开关关闭并选择清除缓存，清除后再移除本插件。\n喜欢的话，欢迎给仓库点个 Star。"
                                                               preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"暂不前往" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"作者主页" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        MJOpenAuthorProfile(presenter);
-    }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"前往 GitHub" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         NSURL *URL = [NSURL URLWithString:@"https://github.com/qiu7c/Tiktok-MJ-for-Wechat"];
         if (URL) [UIApplication.sharedApplication openURL:URL options:@{} completionHandler:nil];
@@ -199,16 +163,6 @@ static NSString *MJCurrentUser(void) {
     return nil;
 }
 
-static id MJServiceForClass(Class serviceClass) {
-    Class centerClass = NSClassFromString(@"MMServiceCenter");
-    SEL defaultSelector = NSSelectorFromString(@"defaultCenter");
-    SEL serviceSelector = NSSelectorFromString(@"getService:");
-    if (!centerClass || !serviceClass || ![centerClass respondsToSelector:defaultSelector]) return nil;
-    id center = ((id (*)(id, SEL))objc_msgSend)(centerClass, defaultSelector);
-    if (!center || ![center respondsToSelector:serviceSelector]) return nil;
-    return ((id (*)(id, SEL, Class))objc_msgSend)(center, serviceSelector, serviceClass);
-}
-
 static NSString *MJTextFromWrap(id wrap) {
     NSString *text = MJString(MJValue(wrap, @"m_nsContent"));
     if (text.length == 0) return @"";
@@ -219,12 +173,11 @@ static NSString *MJTextFromWrap(id wrap) {
             text = [text substringFromIndex:NSMaxRange(separator)];
         }
     }
-    return [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return text;
 }
 
 static BOOL MJMatches(id object) {
     NSString *text = [object isKindOfClass:NSString.class] ? object : MJTextFromWrap(object);
-    text = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (text.length < 2 || text.length % 2 != 0) return NO;
     for (NSUInteger index = 0; index < text.length; index += 2) {
         if ([[text substringWithRange:NSMakeRange(index, 2)] caseInsensitiveCompare:@"mj"] != NSOrderedSame) return NO;
@@ -269,13 +222,21 @@ static NSArray<NSString *> *MJMessageIdentities(id wrap) {
 }
 
 static void MJPruneIncomingLocked(NSTimeInterval now) {
-    const NSTimeInterval pendingTTL = 300.0;
+    const NSTimeInterval pendingTTL = 600.0;
     const NSTimeInterval consumedTTL = 600.0;
     for (NSString *key in MJPendingIncoming.allKeys) {
         if (now - MJPendingIncoming[key].doubleValue > pendingTTL) [MJPendingIncoming removeObjectForKey:key];
     }
     for (NSString *key in MJConsumedIncoming.allKeys) {
         if (now - MJConsumedIncoming[key].doubleValue > consumedTTL) [MJConsumedIncoming removeObjectForKey:key];
+    }
+    const NSUInteger maximumPendingIdentities = 384;
+    if (MJPendingIncoming.count > maximumPendingIdentities) {
+        NSArray<NSString *> *oldestFirst = [MJPendingIncoming keysSortedByValueUsingSelector:@selector(compare:)];
+        NSUInteger excess = MJPendingIncoming.count - maximumPendingIdentities;
+        for (NSUInteger index = 0; index < excess; index++) {
+            [MJPendingIncoming removeObjectForKey:oldestFirst[index]];
+        }
     }
 }
 
@@ -338,8 +299,30 @@ static id MJMessageWrapForCell(id cell) {
            MJValue(parentModel, @"msgWrap") ?: MJValue(parentModel, @"wrap");
 }
 
+static BOOL MJCellIsVisibleInForeground(UIView *cell) {
+    UIWindow *window = cell.window;
+    UIApplication *application = UIApplication.sharedApplication;
+    if (!window || window.hidden || window.alpha <= 0.0 ||
+        application.applicationState != UIApplicationStateActive ||
+        (window.windowScene && window.windowScene.activationState != UISceneActivationStateForegroundActive)) {
+        return NO;
+    }
+    for (UIView *view = cell; view; view = view.superview) {
+        if (view.hidden || view.alpha <= 0.0) return NO;
+    }
+    CGRect visibleRect = [cell convertRect:cell.bounds toView:window];
+    for (UIView *view = cell; view; view = view.superview) {
+        if (view.clipsToBounds) {
+            visibleRect = CGRectIntersection(visibleRect, [view convertRect:view.bounds toView:window]);
+            if (CGRectIsEmpty(visibleRect)) return NO;
+        }
+    }
+    return CGRectIntersectsRect(visibleRect, window.bounds);
+}
+
 static void MJCheckIncomingCell(UIView *cell) {
-    if (!cell.window || ![NSUserDefaults.standardUserDefaults boolForKey:MJEnabledKey]) return;
+    if (!MJCellIsVisibleInForeground(cell) ||
+        ![NSUserDefaults.standardUserDefaults boolForKey:MJEnabledKey]) return;
     id wrap = MJMessageWrapForCell(cell);
     if ([MJValue(wrap, @"m_uiMessageType") integerValue] != 1 ||
         !MJIncomingWrap(wrap) || !MJMatches(wrap)) return;
@@ -353,6 +336,7 @@ static void MJScheduleIncomingCellCheck(UIView *cell) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIView *strongCell = weakCell;
         if (!strongCell) return;
+        if (strongCell.window) [MJVisibleMessageCells addObject:strongCell];
         MJCheckIncomingCell(strongCell);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             UIView *delayedCell = weakCell;
@@ -418,6 +402,7 @@ static void MJScheduleIncomingCellCheck(UIView *cell) {
     %orig;
     UIView *cell = (UIView *)self;
     if (cell.window) MJScheduleIncomingCellCheck(cell);
+    else [MJVisibleMessageCells removeObject:cell];
 }
 %end
 
@@ -425,9 +410,18 @@ static void MJScheduleIncomingCellCheck(UIView *cell) {
     MJIncomingLock = [NSLock new];
     MJPendingIncoming = [NSMutableDictionary dictionary];
     MJConsumedIncoming = [NSMutableDictionary dictionary];
+    MJVisibleMessageCells = [NSHashTable weakObjectsHashTable];
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSUserDefaults.standardUserDefaults registerDefaults:@{MJEnabledKey: @YES}];
         MJInstallEnablePrompt();
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                           object:nil
+                                                            queue:NSOperationQueue.mainQueue
+                                                       usingBlock:^(__unused NSNotification *note) {
+            for (UIView *cell in MJVisibleMessageCells.allObjects) {
+                MJScheduleIncomingCellCheck(cell);
+            }
+        }];
         Class managerClass = NSClassFromString(@"WCPluginsMgr");
         if (managerClass && [managerClass respondsToSelector:@selector(sharedInstance)]) {
             WCPluginsMgr *manager = [managerClass sharedInstance];

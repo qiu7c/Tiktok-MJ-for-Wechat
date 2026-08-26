@@ -535,6 +535,7 @@ static id MJActiveSession;
     UIWindowScene *scene = hostWindow.windowScene;
     if (!hostWindow || !scene || !URL) {
         MJLog(@"[MJ彩蛋] 无法开始透明视频：window=%@ URL=%@", hostWindow ? @"YES" : @"NO", URL.path ?: @"-");
+        [self stop];
         return;
     }
     self.overlayWindow = [[NeoWCPassthroughWindow alloc] initWithWindowScene:scene];
@@ -582,7 +583,6 @@ static id MJActiveSession;
 }
 
 - (void)stop {
-    if (self.stopping) return;
     self.stopping = YES;
     [self.player pause];
     if (self.endObserver) [NSNotificationCenter.defaultCenter removeObserver:self.endObserver];
@@ -623,11 +623,13 @@ static NSUInteger MJNextClipIndex;
     UIWindow *hostWindow = NeoWCMJEasterEggWindow();
     if (!hostWindow || self.URLs.count == 0) {
         MJLog(@"[MJ彩蛋] 无法开始：window=%@ clips=%lu", hostWindow ? @"YES" : @"NO", (unsigned long)self.URLs.count);
+        [self stop];
         return;
     }
     UIWindowScene *scene = hostWindow.windowScene;
     if (!scene) {
         MJLog(@"[MJ彩蛋] 微信窗口没有可用的 UIWindowScene");
+        [self stop];
         return;
     }
     self.overlayWindow = [[NeoWCPassthroughWindow alloc] initWithWindowScene:scene];
@@ -710,17 +712,73 @@ static NSUInteger MJNextClipIndex;
 
 @end
 
+static void MJStopActiveSession(NSString *reason) {
+    id session = MJActiveSession;
+    if (!session) return;
+    MJActiveSession = nil;
+    MJLog(@"[MJ彩蛋] 清理动画会话：%@", reason.length > 0 ? reason : @"未说明原因");
+    [session stop];
+}
+
+static BOOL MJActiveSessionIsUsable(void) {
+    if (!MJActiveSession || [MJActiveSession stopping]) return NO;
+    if ([MJActiveSession isKindOfClass:NeoWCAlphaVideoSession.class]) {
+        NeoWCAlphaVideoSession *session = (NeoWCAlphaVideoSession *)MJActiveSession;
+        return session.overlayWindow != nil && session.player != nil;
+    }
+    if ([MJActiveSession isKindOfClass:NeoWCMJEasterEggSession.class]) {
+        NeoWCMJEasterEggSession *session = (NeoWCMJEasterEggSession *)MJActiveSession;
+        return session.overlayWindow != nil && session.videoViews.count > 0;
+    }
+    return NO;
+}
+
+static void MJInstallPlaybackLifecycleObservers(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+        [center addObserverForName:UIApplicationDidEnterBackgroundNotification
+                           object:nil
+                            queue:NSOperationQueue.mainQueue
+                       usingBlock:^(__unused NSNotification *note) {
+            MJStopActiveSession(@"微信进入后台");
+        }];
+        [center addObserverForName:UIApplicationWillTerminateNotification
+                           object:nil
+                            queue:NSOperationQueue.mainQueue
+                       usingBlock:^(__unused NSNotification *note) {
+            MJStopActiveSession(@"微信即将终止");
+        }];
+    });
+}
+
+static void MJInstallSessionWatchdog(id session) {
+    __weak id weakSession = session;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        id strongSession = weakSession;
+        if (strongSession && MJActiveSession == strongSession) {
+            MJStopActiveSession(@"播放超时保险");
+        }
+    });
+}
+
 void MJPlayEasterEgg(void) {
+    MJInstallPlaybackLifecycleObservers();
     void (^playBlock)(void) = ^{
         if (![NSUserDefaults.standardUserDefaults boolForKey:MJEnabledKey]) {
             MJLog(@"[MJ彩蛋] 独立开关已关闭，忽略触发");
             return;
         }
-        if (MJActiveSession && ![MJActiveSession stopping]) {
+        if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive ||
+            !NeoWCMJEasterEggWindow()) {
+            MJLog(@"[MJ彩蛋] 微信不在可播放的前台状态，忽略本次触发");
+            return;
+        }
+        if (MJActiveSessionIsUsable()) {
             MJLog(@"[MJ彩蛋] 已有动画播放中，忽略重复触发");
             return;
         }
-        [MJActiveSession stop];
+        MJStopActiveSession(@"替换无效动画会话");
         NSArray<NSURL *> *URLs = NeoWCMJEasterEggMaterializeResources();
         if (URLs.count == 0) return;
         NSURL *selectedURL = URLs[MJNextClipIndex % URLs.count];
@@ -732,12 +790,14 @@ void MJPlayEasterEgg(void) {
             NeoWCAlphaVideoSession *alphaSession = [NeoWCAlphaVideoSession new];
             MJActiveSession = alphaSession;
             [alphaSession startWithURL:selectedURL];
+            if (MJActiveSession == alphaSession) MJInstallSessionWatchdog(alphaSession);
             return;
         }
         NeoWCMJEasterEggSession *session = [NeoWCMJEasterEggSession new];
         session.URLs = @[selectedURL];
         MJActiveSession = session;
         [session start];
+        if (MJActiveSession == session) MJInstallSessionWatchdog(session);
     };
     if ([NSThread isMainThread]) playBlock();
     else dispatch_async(dispatch_get_main_queue(), playBlock);

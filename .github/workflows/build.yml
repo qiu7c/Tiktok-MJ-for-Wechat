@@ -9,36 +9,54 @@ on:
 
 jobs:
   build:
-    name: Build (${{ matrix.scheme }})
+    name: Build release artifacts
     runs-on: macos-15
-    env:
-      THEOS: ${{ github.workspace }}/theos
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - scheme: rootful
-            make_args: ""
-          - scheme: rootless
-            make_args: "THEOS_PACKAGE_SCHEME=rootless"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Theos
+      - name: Set up Theos toolchains
+        env:
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
         run: |
           brew install ldid
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$RUNNER_TEMP/theos-rootless"
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git "$RUNNER_TEMP/theos-roothide"
           git clone --depth 1 https://github.com/theos/sdks.git "$RUNNER_TEMP/theos-sdks"
-          cp -R "$RUNNER_TEMP"/theos-sdks/*.sdk "$THEOS/sdks/"
+          cp -R "$RUNNER_TEMP"/theos-sdks/*.sdk "$RUNNER_TEMP/theos-rootless/sdks/"
+          cp -R "$RUNNER_TEMP"/theos-sdks/*.sdk "$RUNNER_TEMP/theos-roothide/sdks/"
 
-      - name: Build package
-        run: make clean package FINALPACKAGE=1 ${{ matrix.make_args }}
+      - name: Build universal dylib and rootless package
+        run: |
+          export THEOS="$RUNNER_TEMP/theos-rootless"
+          make clean package FINALPACKAGE=1 ARCHS="arm64 arm64e" THEOS_PACKAGE_SCHEME=rootless THEOS_PACKAGE_ARCH=iphoneos-arm64
+          mkdir -p dist
+          test -f .theos/obj/TiktokMJ.dylib
+          ROOTLESS_DEB="$(find packages -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          test -f "$ROOTLESS_DEB"
+          lipo .theos/obj/TiktokMJ.dylib -verify_arch arm64 arm64e
+          cp .theos/obj/TiktokMJ.dylib dist/TiktokMJ.dylib
+          cp "$ROOTLESS_DEB" dist/TiktokMJ_iphoneos-arm64.deb
 
-      - name: Upload package
+      - name: Build RootHide package
+        run: |
+          export THEOS="$RUNNER_TEMP/theos-roothide"
+          make clean
+          find packages -maxdepth 1 -type f -name '*.deb' -delete
+          make package FINALPACKAGE=1 ARCHS="arm64 arm64e" THEOS_PACKAGE_SCHEME=roothide THEOS_PACKAGE_ARCH=iphoneos-arm64e
+          ROOTHIDE_DEB="$(find packages -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          test -f "$ROOTHIDE_DEB"
+          cp "$ROOTHIDE_DEB" dist/TiktokMJ_iphoneos-arm64e.deb
+
+      - name: Verify release files
+        run: |
+          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" = "3"
+          ls -lh dist
+
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: TiktokMJ-${{ matrix.scheme }}
-          path: packages/*.deb
+          name: TiktokMJ
+          path: dist/*
           if-no-files-found: error

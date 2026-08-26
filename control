@@ -1,6 +1,6 @@
 Package: com.qiu7c.tiktok-mj
 Name: Tiktok MJ for WeChat
-Version: 1.0.1
+Version: 1.0.2
 Architecture: iphoneos-arm64
 Description: Independent MJ easter egg animation tweak for WeChat
 Maintainer: qiu7c
